@@ -1,5 +1,7 @@
 # netspeed
 
+[![CI](https://github.com/411231041-web/netspeed/actions/workflows/ci.yml/badge.svg)](https://github.com/411231041-web/netspeed/actions/workflows/ci.yml)
+
 English version: [README.md](README.md)
 
 Измеряет скорость скачивания с этой машины: последовательно запрашивает
@@ -267,6 +269,10 @@ black --line-length 79 --check --diff .
 mypy .
 ```
 
+CI (`.github/workflows/ci.yml`) прогоняет те же проверки на каждый push
+в `main` и каждый pull request: четыре проверки один раз, на Python
+3.13, и `pytest` на Python с 3.10 по 3.14.
+
 Набор тестов поднимает локальный HTTP-сервер и локальный прямой прокси
 на эфемерных портах, поэтому сеть ему не нужна. Тот же сервер можно
 запустить вручную как цель измерения — это удобно на машине без доступа
@@ -294,6 +300,7 @@ tests/http_server.py        локальный сервер-цель для те
 tests/http_proxy.py         локальный прямой прокси для тестов
 tests/conftest.py           фикстуры pytest (сервер, прокси, URL эндпоинтов)
 tests/test_netspeed.py      набор тестов
+.github/workflows/ci.yml    GitHub Actions: тесты и линтеры
 setup.cfg                   настройки flake8 и isort
 requirements.txt            зависимость времени выполнения
 requirements-dev.txt        инструменты для тестов и линтеров

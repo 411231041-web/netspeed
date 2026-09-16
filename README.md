@@ -1,5 +1,7 @@
 # netspeed
 
+[![CI](https://github.com/411231041-web/netspeed/actions/workflows/ci.yml/badge.svg)](https://github.com/411231041-web/netspeed/actions/workflows/ci.yml)
+
 Russian version: [README.ru.md](README.ru.md)
 
 Measures download speed from this machine by fetching one URL several
@@ -253,6 +255,10 @@ black --line-length 79 --check --diff .
 mypy .
 ```
 
+CI (`.github/workflows/ci.yml`) runs the same checks on every push to
+`main` and every pull request: the four checks once, on Python 3.13, and
+`pytest` on Python 3.10 through 3.14.
+
 The suite starts a local HTTP server and a local forward proxy on
 ephemeral ports, so it needs no network access. The same server can be
 run by hand as a measurement target, which is useful on a machine with
@@ -280,6 +286,7 @@ tests/http_server.py        local target server used by the tests
 tests/http_proxy.py         local forward proxy used by the tests
 tests/conftest.py           pytest fixtures (server, proxy, endpoint URLs)
 tests/test_netspeed.py      test suite
+.github/workflows/ci.yml    GitHub Actions workflow: tests and lint
 setup.cfg                   flake8 and isort configuration
 requirements.txt            runtime dependency
 requirements-dev.txt        test and lint tooling
