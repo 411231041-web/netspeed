@@ -31,7 +31,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import IO, NoReturn
+from typing import IO, Any, NoReturn
 from urllib.parse import unquote, urlsplit
 
 import requests
@@ -1408,18 +1408,24 @@ def _bare(word: str) -> str:
     ``argparse`` renders a rejected value between quotes, so the
     argument a word came from appears as ``'value'`` rather than
     ``value`` and has to be unwrapped before it can be matched against
-    the argument list.
+    the argument list. A quoted argument that contains whitespace is
+    split where it is written, so its pieces carry only the opening
+    quote or only the closing one, and each boundary is removed on its
+    own.
 
     Args:
         word: One whitespace-delimited word of an error message.
 
     Returns:
-        The word with one pair of surrounding quotes removed.
+        The word with any surrounding quotes removed.
     """
-    for quote in ("'", '"'):
-        if len(word) > 1 and word.startswith(quote) and word.endswith(quote):
-            return word[1:-1]
-    return word
+    start = 0
+    stop = len(word)
+    if len(word) > 1 and word[0] in ("'", '"'):
+        start = 1
+    if stop - start > 1 and word[-1] in ("'", '"'):
+        stop -= 1
+    return word[start:stop]
 
 
 def _looks_like_credential(word: str) -> bool:
@@ -1588,8 +1594,9 @@ class RedactingArgumentParser(argparse.ArgumentParser):
         ``argparse`` repeats what the user typed in several shapes: a
         value attached to its option with ``=``, the pieces of an
         argument that contains whitespace, the remainder it reports when
-        it peels known short flags from a cluster such as ``-vvsecret``,
-        and a token that merely extends a known long option such as
+        it peels known short flags from a cluster such as ``-vvsecret``
+        (named there with and without the dash that was peeled), and a
+        token that merely extends a known long option such as
         ``--jsonsecret``. Each shape is recognised by structure rather
         than by content, so a credential is withheld even though
         nothing in it looks like one, while a plain typo such as
@@ -1618,9 +1625,11 @@ class RedactingArgumentParser(argparse.ArgumentParser):
                 continue
             index = 1
             while index < len(token) and f"-{token[index]}" in options:
-                remainder = "-" + token[index + 1 :]
-                if remainder != "-":
-                    guarded.add(remainder)
+                tail = token[index + 1 :]
+                if tail:
+                    guarded.add(f"-{tail}")
+                    guarded.add(tail)
+                    guarded.update(tail.split())
                 index += 1
         return frozenset(guarded)
 
@@ -1632,6 +1641,14 @@ def build_parser() -> RedactingArgumentParser:
         Parser accepting a URL plus the run, timeout, chunk, and output
         options.
     """
+    extra: dict[str, Any] = {}
+    if sys.version_info >= (3, 14):
+        # argparse 3.14 colours its usage text by asking sys.stdout
+        # whether it is a terminal, and a closed stream makes that
+        # question raise while the parser is being built. The report is
+        # plain text on a stream that may be a pipe or a log, so the
+        # question is not asked.
+        extra["color"] = False
     parser = RedactingArgumentParser(
         prog="netspeed",
         description=(
@@ -1645,6 +1662,7 @@ def build_parser() -> RedactingArgumentParser:
             "--timeout is an inactivity limit per read, not a total "
             "deadline."
         ),
+        **extra,
     )
     parser.add_argument(
         "url",

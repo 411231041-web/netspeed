@@ -1881,6 +1881,51 @@ def test_main_hides_a_split_secret_behind_a_cluster(
 
 
 @pytest.mark.parametrize(
+    ("arguments", "message", "secret"),
+    [
+        (["-vSECRETpw"], "unrecognized arguments: -SECRETpw", "SECRETpw"),
+        (
+            ["-vSECRETpw"],
+            "ignored explicit argument 'SECRETpw'",
+            "SECRETpw",
+        ),
+        (
+            ["-valice:pa VEXILrest"],
+            "ignored explicit argument 'alice:pa VEXILrest'",
+            "VEXILrest",
+        ),
+        (
+            ["-valice:pa  VEXILrest"],
+            "ignored explicit argument 'alice:pa  VEXILrest'",
+            "VEXILrest",
+        ),
+    ],
+)
+def test_error_hides_a_cluster_remainder_in_every_spelling(
+    arguments: list[str],
+    message: str,
+    secret: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A remainder argparse peels off a cluster is withheld.
+
+    Interpreters disagree about the text of the message that names it:
+    the tail of ``-vSECRETpw`` reaches the reader with the dash that was
+    peeled and without it, and a remainder that holds whitespace arrives
+    with only one of its two quotes. Every spelling has to be
+    recognised, whatever interpreter produced it.
+    """
+    parser = netspeed.build_parser()
+    parser.remember_arguments(arguments)
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.error(message)
+
+    assert excinfo.value.code == 2
+    assert secret not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
     "argv",
     [
         ["-x", "http://ok.example/x"],
@@ -1951,8 +1996,15 @@ def test_build_payload_carries_per_run_speeds() -> None:
 
 
 def test_main_stays_fast_on_a_huge_argument_list() -> None:
-    """A credential-free argv fails immediately, not quadratically."""
-    argv = ["--zz%d" % index for index in range(20_000)]
+    """A credential-free argv fails immediately, not quadratically.
+
+    The list stays at the size where ``argparse`` itself is fast:
+    before 3.13 it rescans every option index once per rejected token,
+    so a longer list measures the interpreter rather than this module.
+    The redaction of a large message is asserted on its own by
+    :func:`test_redaction_runs_in_linear_time`.
+    """
+    argv = ["--zz%d" % index for index in range(5_000)]
 
     started = time.monotonic()
     with pytest.raises(SystemExit) as excinfo:
