@@ -78,7 +78,8 @@ pip install -r requirements.txt
 
 ```sh
 # 10 measured requests plus a discarded warm-up
-python netspeed.py https://speed.cloudflare.com/__down?bytes=100000000
+# values of bytes from 100000000 onwards are refused with HTTP 403
+python netspeed.py https://speed.cloudflare.com/__down?bytes=25000000
 
 # 5 requests, 30-second socket timeout, no warm-up
 python netspeed.py -n 5 -t 30 --no-warmup https://example.com/big.jpg

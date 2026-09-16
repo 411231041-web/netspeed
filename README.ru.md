@@ -82,7 +82,8 @@ pip install -r requirements.txt
 
 ```sh
 # 10 измеряемых запросов плюс отброшенный прогрев
-python netspeed.py https://speed.cloudflare.com/__down?bytes=100000000
+# значения bytes от 100000000 сервер отклоняет с ошибкой 403
+python netspeed.py https://speed.cloudflare.com/__down?bytes=25000000
 
 # 5 запросов, таймаут сокета 30 секунд, без прогрева
 python netspeed.py -n 5 -t 30 --no-warmup https://example.com/big.jpg
