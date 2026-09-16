@@ -1,5 +1,7 @@
 # netspeed
 
+Russian version: [README.ru.md](README.ru.md)
+
 Measures download speed from this machine by fetching one URL several
 times in sequence and reporting the average throughput.
 
@@ -15,19 +17,22 @@ times in sequence and reporting the average throughput.
   because "MB/s" alone is ambiguous.
 - **Statistics** — 10 sequential requests by default. The report shows
   the average request time, the mean of the per-run speeds (the
-  headline the task asks for), the pooled rate (`total bytes / total
-  measured time`, which differs from the mean when runs moved different
-  volumes), the median, the extremes, and the sample standard deviation,
-  which a single run reports as not applicable.
+  headline the task asks for), the pooled rate
+  (`total bytes / total measured time`, which differs from the mean when
+  runs moved different volumes), the median, the extremes, and the
+  sample standard deviation, which a single run reports as not
+  applicable.
 
 Each measured run reuses one `requests.Session`, so DNS, TCP, and TLS
 happen once and the runs share a single keep-alive connection — for a
 target that keeps the connection alive and does not redirect. A `3xx`
-answer is followed transparently, which adds its round trips to the
-measured time and makes the body that of the final target while the
-report keeps naming the URL that was requested; a server that answers
-`Connection: close` costs one connection per run. One extra warm-up
-request is sent first and discarded from the statistics.
+answer is followed transparently: its round trips land in the header
+phase (TTFB) and in the mean request time, but not in the speed
+denominator, which is the body time; the body measured is that of the
+final target while the report keeps naming the URL that was requested,
+and a server that answers `Connection: close` costs one connection per
+run. One extra warm-up request is sent first and discarded from the
+statistics.
 
 ## How the volume is counted
 
