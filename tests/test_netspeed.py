@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import socket
@@ -17,6 +18,7 @@ import pytest
 import requests
 
 import netspeed
+from tests.http_proxy import ForwardProxy
 from tests.http_server import (
     CLOSE_DELIMITED_BYTES,
     CODED_TE_BYTES,
@@ -1793,9 +1795,6 @@ def test_failure_kind_names_the_likely_cause() -> None:
 @pytest.mark.parametrize(
     "error",
     [
-        requests.exceptions.ProxyError(
-            "Cannot connect to proxy.", TimeoutError("timed out")
-        ),
         requests.exceptions.SSLError("timed out during handshake"),
         requests.exceptions.TooManyRedirects("exceeded 30 redirects"),
         requests.exceptions.InvalidURL("no host"),
@@ -1806,6 +1805,36 @@ def test_failure_kind_keeps_the_class_when_it_speaks(
 ) -> None:
     """A class that names its own cause is not given another one."""
     assert netspeed._failure_kind(error) == type(error).__name__
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "('CONNECT')",
+        "500 Permission Denied",
+        "502 Cannot connect to destination",
+    ],
+)
+def test_failure_kind_reads_the_proxy_verdict_from_the_chain(
+    tail: str,
+) -> None:
+    """A refused CONNECT tunnel is told apart from a dead proxy port."""
+    try:
+        raise OSError(f"Tunnel connection failed: {tail}")
+    except OSError as refusal:
+        error = requests.exceptions.ProxyError(refusal)
+    assert "refused the CONNECT tunnel" in netspeed._failure_kind(error)
+
+
+def test_failure_kind_names_an_unreached_proxy_without_a_tunnel() -> None:
+    """Refusal before any tunnel is reported as an unreachable proxy."""
+    error = requests.exceptions.ProxyError(
+        ConnectionRefusedError(111, "Connection refused")
+    )
+    kind = netspeed._failure_kind(error)
+    assert kind.startswith("ProxyError ")
+    assert "the proxy is unreachable or refused" in kind
+    assert "CONNECT" not in kind
 
 
 @pytest.mark.parametrize(
@@ -2300,3 +2329,245 @@ def test_main_accepts_a_zero_padded_run_count(
 
     assert code == 1
     assert "out of range" not in capsys.readouterr().err
+
+
+def test_validate_proxy_accepts_spellings() -> None:
+    """http(s) and socks proxies and a bare host:port are accepted."""
+    assert netspeed.validate_proxy("http://g:3128") == "http://g:3128"
+    assert netspeed.validate_proxy("https://g:8443") == "https://g:8443"
+    assert netspeed.validate_proxy("socks5://g:1080") == "socks5://g:1080"
+    assert netspeed.validate_proxy("g:3128") == "g:3128"
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "ftp://g:3128",
+        "http:/missing-slash",
+        "http:///x",
+        "http://g:99999",
+        "g:notaport",
+        "g:notaport/",
+    ],
+)
+def test_validate_proxy_rejects_unusable_urls(proxy: str) -> None:
+    """A proxy the transport could not use is refused before connecting."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        netspeed.validate_proxy(proxy)
+
+
+def test_validate_proxy_refusal_never_echoes_the_argument() -> None:
+    """A credential typed in the proxy does not reach the error text."""
+    with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+        netspeed.validate_proxy("http://alice:s3cr3t@g:99999")
+
+    assert "s3cr3t" not in str(excinfo.value)
+
+
+def test_apply_proxy_covers_both_schemes() -> None:
+    """The proxy mapping lists http and https, so HTTPS tunnels too."""
+    session = requests.Session()
+    try:
+        netspeed.apply_proxy(session, "http://g:3128")
+        assert session.proxies == {
+            "http": "http://g:3128",
+            "https": "http://g:3128",
+        }
+    finally:
+        session.close()
+
+
+def test_session_route_sets_the_proxy_and_unlocks_the_environment() -> None:
+    """A routed session carries the proxy and distrusts the env vars."""
+    with netspeed.session_route("http://g:3128") as (session, proxy):
+        assert proxy == "http://g:3128"
+        assert session.proxies["http"] == "http://g:3128"
+        assert session.proxies["https"] == "http://g:3128"
+        assert session.trust_env is False
+
+
+def test_session_route_direct_pins_the_session_to_the_wire() -> None:
+    """Without a proxy the session is direct and ignores http_proxy."""
+
+    session_holder: list[requests.Session] = []
+    with netspeed.session_route(None) as (session, proxy):
+        session_holder.append(session)
+        assert proxy is None
+        assert session.trust_env is False
+
+    assert session_holder[0].proxies == {}
+
+
+def test_main_routes_through_a_local_forward_proxy(
+    proxy: ForwardProxy,
+    payload_url: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--proxy sends every request through the named proxy."""
+    exit_code = netspeed.main(
+        [payload_url, "-n", "2", "--no-warmup", "-p", proxy.base_url]
+    )
+
+    assert exit_code == 0
+    assert len(proxy.plain_requests) == 2
+    assert all(line.startswith("GET http://") for line in proxy.plain_requests)
+    assert "Proxy: " in capsys.readouterr().out
+
+
+def test_main_https_target_tunnels_through_the_proxy(
+    server: LocalServer,
+    proxy: ForwardProxy,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An https:// target is tunnelled, CONNECT names the authority."""
+    tls_target = server.base_url.replace("http://", "https://")
+    exit_code = netspeed.main(
+        [tls_target, "-n", "1", "--no-warmup", "-p", proxy.base_url]
+    )
+
+    assert exit_code == 1  # the plain local server cannot speak TLS
+    assert proxy.plain_requests == []  # nothing leaked in plain form
+    assert proxy.connects == [server.base_url.split("//")[1]]
+
+
+def test_main_reports_a_routed_measurement_in_json(
+    proxy: ForwardProxy,
+    payload_url: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--json carries the proxy, redacted, alongside the URL."""
+    credentialed = "http://alice:s3cr3t@" + proxy.base_url.split("//")[1]
+    exit_code = netspeed.main(
+        [payload_url, "-n", "1", "--json", "--no-warmup", "-p", credentialed]
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["proxy"] == "http://***@" + proxy.base_url.split("//")[1]
+    assert "s3cr3t" not in out
+
+
+def test_main_failure_message_hides_proxy_credentials(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failing proxied run never writes the proxy password to stderr."""
+    exit_code = netspeed.main(
+        [
+            "http://127.0.0.1:1/big.jpg",
+            "-n",
+            "1",
+            "-p",
+            "http://alice:s3cr3t@127.0.0.1:1",
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "s3cr3t" not in captured.err
+    assert "measurement failed" in captured.err
+
+
+def test_main_keeps_the_environment_out_of_the_route(
+    payload_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient proxy variables do not route an unqualified run."""
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "NO_PROXY",
+    ):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+
+    assert netspeed.main([payload_url, "-n", "1", "--no-warmup"]) == 0
+
+
+def test_main_failure_with_socks_proxy_names_the_dependency(
+    payload_url: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A SOCKS proxy without PySocks fails with a hint, not a crash."""
+    if importlib.util.find_spec("socks") is not None:
+        pytest.skip("PySocks is installed; the hint path is unreachable")
+
+    exit_code = netspeed.main(
+        [payload_url, "-n", "1", "-p", "socks5://127.0.0.1:1"]
+    )
+
+    assert exit_code == 1
+    assert "PySocks" in capsys.readouterr().err
+
+
+def test_main_rejects_a_bad_proxy_before_any_request(
+    server: LocalServer,
+    payload_url: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unusable proxy is a usage error, not a transport failure."""
+    seen = len(server.requests_seen)
+    with pytest.raises(SystemExit) as excinfo:
+        netspeed.main([payload_url, "-n", "1", "-p", "http://g:99999"])
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "proxy port" in captured.err
+    assert len(server.requests_seen) == seen
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "socks5://127.0.0.1:9050",
+        "socks4://127.0.0.1:1080",
+    ],
+)
+def test_failed_run_suggests_remote_dns_spelling(
+    proxy: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A dying client-resolving socks run advertises socks5h/socks4a."""
+    assert (
+        netspeed.main(["http://127.0.0.1:1/big.jpg", "-n", "1", "-p", proxy])
+        == 1
+    )
+    sibling = "socks5h" if proxy.startswith("socks5") else "socks4a"
+    assert f"spelled {sibling}" in capsys.readouterr().err
+
+
+def test_failed_http_proxy_run_stays_quiet_about_dns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The dns suggestion belongs to client-resolving socks alone."""
+    assert (
+        netspeed.main(
+            [
+                "http://127.0.0.1:1/big.jpg",
+                "-n",
+                "1",
+                "-p",
+                "http://127.0.0.1:1",
+            ]
+        )
+        == 1
+    )
+    assert "resolves the hostname" not in capsys.readouterr().err
+
+
+def test_parses_remote_dns_scheme_for_failures() -> None:
+    """Only bare socks4/socks5 map to a remote-resolving sibling."""
+    assert netspeed._remote_dns_scheme("socks5://g:9050") == "socks5h"
+    assert netspeed._remote_dns_scheme("socks4://g:1080") == "socks4a"
+    assert netspeed._remote_dns_scheme("socks5h://g:9050") is None
+    assert netspeed._remote_dns_scheme("http://g:3128") is None
+
+
+def test_parsed_proxy_defaults_to_none() -> None:
+    """Without the option the route stays direct (proxy is None)."""
+    args = netspeed.build_parser().parse_args(["http://example.com/x"])
+
+    assert args.proxy is None

@@ -78,7 +78,6 @@ pip install -r requirements.txt
 
 ```sh
 # 10 measured requests plus a discarded warm-up
-# values of bytes from 100000000 onwards are refused with HTTP 403
 python netspeed.py https://speed.cloudflare.com/__down?bytes=25000000
 
 # 5 requests, 30-second socket timeout, no warm-up
@@ -89,13 +88,44 @@ python netspeed.py --json https://example.com/big.jpg
 
 # per-run detail and tracebacks on stderr
 python netspeed.py -v https://example.com/big.jpg
+
+# through a forward proxy; a bare host:port counts as http://
+python netspeed.py -p http://proxy.com:3128 https://example.com/big.jpg
+
+# a proxy with credentials; they reach the proxy but are printed as ***
+python netspeed.py -p http://user:pass@proxy.com:3128 https://example.com/big.jpg
+
+# a SOCKS proxy, e.g. the Tor daemon; needs the PySocks package
+python netspeed.py -p socks5://127.0.0.1:9050 https://example.com/big.jpg
+
+# the same through remote DNS (recommended for Tor): the proxy itself
+# resolves the hostname
+python netspeed.py -p socks5h://127.0.0.1:9050 https://example.com/big.jpg
 ```
 
 Options: `-n/--runs` (1..1000, default 10), `-t/--timeout` (up to 3600
 seconds, default 15), `--chunk-size` (up to 16 MiB, default 64 KiB),
-`--no-warmup`, `--json`, `-v/--verbose`. `--runs` and `--chunk-size` are
-whole numbers and `--timeout` a decimal number of seconds; leading zeros
-are padding.
+`--no-warmup`, `-p/--proxy`, `--json`, `-v/--verbose`. `--runs` and
+`--chunk-size` are whole numbers and `--timeout` a decimal number of
+seconds; leading zeros are padding.
+
+By default the measurement connects directly and proxy environment
+variables (`http_proxy`, `HTTPS_PROXY`, …) are ignored, so the route in
+force is always the one the invocation names. `-p/--proxy` routes every
+request through the given proxy instead — an `https://` target is sent
+through it as a `CONNECT` tunnel — and the report and the JSON payload
+then name the proxy, with any `user:password` in it redacted. The proxy
+must speak http or one of the socks spellings and obeys the same host
+and port rules as the URL argument; a bad proxy is a usage error before
+any request is made. A bare `host:port` counts as `http://` — a SOCKS
+endpoint (say, the Tor daemon listening on `127.0.0.1:9050`) needs an
+explicit scheme, preferably `socks5h://`, where the proxy itself
+resolves the hostname. The `socks5://` and `socks4://` spellings resolve
+the name on this machine, which can leave the proxy chasing an address
+picked for this network; when such a run fails, the report suggests
+their remote-resolving siblings (`socks5h://`, `socks4a://`) instead.
+SOCKS additionally needs the `PySocks` package, which the transport
+error names when the dependency is missing.
 
 `--timeout` is a socket timeout applied to the connection attempt and to
 each read, so it limits inactivity rather than the total duration of a
@@ -206,7 +236,7 @@ latency rather than throughput and the numbers will be meaningless.
 | ---- | ------- |
 | 0 | Measurement completed |
 | 1 | A request or response failed (transport error, 4xx/5xx, empty body, size mismatch, unmeasurable run), or the report could not be written |
-| 2 | Unusable arguments (non-http(s) URL, unusable port, bad `--runs`, `--timeout`, or `--chunk-size`) |
+| 2 | Unusable arguments (non-http(s) URL, unusable port, bad `--runs`, `--timeout`, `--chunk-size`, or `--proxy`) |
 | 130 | Interrupted by the user (Ctrl-C) |
 
 A failed run aborts the series; no partial average is printed.
@@ -223,9 +253,10 @@ black --line-length 79 --check --diff .
 mypy .
 ```
 
-The suite starts a local HTTP server on an ephemeral port, so it needs no
-network access. The same server can be run by hand as a measurement
-target, which is useful on a machine with no internet access:
+The suite starts a local HTTP server and a local forward proxy on
+ephemeral ports, so it needs no network access. The same server can be
+run by hand as a measurement target, which is useful on a machine with
+no internet access:
 
 ```sh
 python tests/http_server.py --port 8123
@@ -233,12 +264,21 @@ python tests/http_server.py --port 8123
 python netspeed.py -n 3 http://127.0.0.1:8123/payload
 ```
 
+The proxy can be exercised the same way:
+
+```sh
+python tests/http_proxy.py
+# in another terminal
+python netspeed.py -n 3 -p http://127.0.0.1:<port> http://127.0.0.1:8123/payload
+```
+
 ## Layout
 
 ```
 netspeed.py                 measurement CLI
 tests/http_server.py        local target server used by the tests
-tests/conftest.py           pytest fixtures (server, endpoint URLs)
+tests/http_proxy.py         local forward proxy used by the tests
+tests/conftest.py           pytest fixtures (server, proxy, endpoint URLs)
 tests/test_netspeed.py      test suite
 setup.cfg                   flake8 and isort configuration
 requirements.txt            runtime dependency

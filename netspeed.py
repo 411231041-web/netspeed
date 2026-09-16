@@ -11,6 +11,10 @@ does not distort the speed figure; TTFB is reported separately. The
 volume counted is the decoded body size: with ``Accept-Encoding:
 identity`` a cooperating server sends it uncompressed, and a server
 that compresses anyway is reported with a warning.
+
+The measurement goes directly by default and can be routed through an
+explicit ``--proxy``; proxy environment variables are ignored either
+way, so the route in force is always the one the invocation names.
 """
 
 from __future__ import annotations
@@ -24,7 +28,8 @@ import re
 import statistics
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import IO, NoReturn
 from urllib.parse import unquote, urlsplit
@@ -550,6 +555,154 @@ def _authority_end(rest: str) -> int:
     return len(rest)
 
 
+_PROXY_SCHEMES = ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+"""Proxy URL schemes this tool accepts.
+
+``http`` and ``https`` proxies work with ``requests`` alone; the SOCKS
+family needs the ``PySocks`` package installed, which the option names
+in its help so a refusal by the transport explains itself.
+"""
+
+_LOCAL_DNS_SOCKS = {"socks4": "socks4a", "socks5": "socks5h"}
+"""Client-resolving SOCKS schemes mapped to their remote-DNS siblings.
+
+``socks5h`` and ``socks4a`` exist because a name resolved on this
+machine can strand the proxy with an address worthless from its own
+vantage point: a CDN picks an edge for this network, while the proxy
+must reach the file from elsewhere. When a run behind one of these
+spellings dies on a timeout, the failure points at the sibling.
+"""
+
+
+def _remote_dns_scheme(proxy: str) -> str | None:
+    """Name the sibling scheme that pushes hostname lookup to the proxy.
+
+    Args:
+        proxy: Proxy URL as validated by :func:`validate_proxy`.
+
+    Returns:
+        The remote-resolving scheme name such as ``socks5h``, or
+        ``None`` when the spelling is not a client-resolving SOCKS one.
+    """
+    scheme = proxy.split("://", 1)[0]
+    return _LOCAL_DNS_SOCKS.get(scheme.lower())
+
+
+def validate_proxy(proxy: str) -> str:
+    """Check that a proxy URL is usable for routing the measurement.
+
+    A proxy with a wrong port or no host would only fail later at the
+    transport level, where the message would be about a tunnel rather
+    than about the argument that caused it, so the same authority rules
+    the URL option follows are applied here. A proxy spelled without a
+    scheme is read as HTTP, which is the spelling of a bare ``host:
+    port``.
+
+    Args:
+        proxy: Candidate proxy URL.
+
+    Returns:
+        The proxy URL unchanged when it is valid.
+
+    Raises:
+        argparse.ArgumentTypeError: The argument cannot be parsed, its
+            scheme is not one of ``_PROXY_SCHEMES``, its host is
+            missing, or its authority is not a literal host with an
+            optional port in ``1..65535``. The same type the other
+            validators raise, so ``argparse`` reports the message
+            alone and never re-counts the argument with ``%r``, where
+            a credential typed in the proxy would be echoed. No
+            message echoes the argument, because a scheme-less
+            credential such as ``alice:secret@host`` parses as a
+            scheme named after the user.
+    """
+    candidate = f"http://{proxy}" if "://" not in proxy else proxy
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "the proxy could not be parsed"
+        ) from exc
+    if parsed.scheme not in _PROXY_SCHEMES:
+        raise argparse.ArgumentTypeError(
+            "unsupported proxy scheme; use http, https, socks5 (or a "
+            "neighbouring socks spelling)"
+        )
+    if not parsed.netloc or not parsed.hostname:
+        raise argparse.ArgumentTypeError("the proxy has no host")
+    rest = candidate.partition("://")[2]
+    authority = rest[: _authority_end(rest)]
+    if _has_unusable_port(authority.rpartition("@")[2]):
+        raise argparse.ArgumentTypeError(
+            "the proxy port must be a number between 1 and 65535"
+        )
+    return proxy
+
+
+def apply_proxy(session: requests.Session, proxy: str) -> None:
+    """Route every request of a session through one proxy.
+
+    The mapping spells out both schemes, so an ``https://`` target is
+    tunnelled through the proxy as well; listing only ``http`` would
+    send HTTPS traffic directly, which is the mistake the option exists
+    to prevent.
+
+    Args:
+        session: Session whose requests are routed.
+        proxy: Proxy URL validated beforehand.
+
+    Returns:
+        None.
+    """
+    session.proxies = {"http": proxy, "https": proxy}
+
+
+@contextmanager
+def direct_session() -> Iterator[requests.Session]:
+    """Yield a session pinned to a direct, environment-free route.
+
+    The session ignores the ``http_proxy`` family of environment
+    variables, because a speed measurement that promised a direct
+    connection must not be silently routed through whatever the
+    ambient environment names.
+
+    Yields:
+        The session with ``trust_env`` disabled.
+
+    Returns:
+        None.
+    """
+    with requests.Session() as session:
+        session.trust_env = False
+        yield session
+
+
+@contextmanager
+def session_route(
+    proxy: str | None,
+) -> Iterator[tuple[requests.Session, str | None]]:
+    """Open a session routed directly, or through the given proxy.
+
+    This is the one place the session and its routing meet, so the
+    caller cannot end up with a session whose trust environment was
+    forgotten or whose proxy mapping misses one of the two schemes.
+
+    Args:
+        proxy: Validated proxy URL, or ``None`` for a direct route.
+
+    Yields:
+        The session and the proxy actually in force, ``None`` when
+        direct.
+
+    Returns:
+        None.
+    """
+    with direct_session() as session:
+        if proxy is not None:
+            apply_proxy(session, proxy)
+        yield session, proxy
+
+
 def redact_url(url: str) -> str:
     """Hide credentials embedded in a URL.
 
@@ -863,7 +1016,12 @@ def _failure_kind(error: requests.RequestException) -> str:
     taken from the class wherever the class carries it, so a proxy or
     TLS failure keeps its own name even when its text mentions a
     timeout; only the bare ``ConnectionError`` that the HTTP layer
-    raises for a stalled body needs its text consulted.
+    raises for a stalled body needs its text consulted. A ``ProxyError``
+    gets two different readings: ``urllib3`` folds a refusal at the
+    proxy's port and a rejection of a ``CONNECT`` tunnel into the same
+    class, so the exception chain is searched for the tunnel-rejection
+    wording to tell a wrong-spelling mistake (routing SOCKS traffic at
+    an http proxy URL) from an unreachable helper.
 
     Args:
         error: Exception raised by the HTTP layer.
@@ -875,6 +1033,24 @@ def _failure_kind(error: requests.RequestException) -> str:
     kind = type(error).__name__
     if isinstance(error, requests.ConnectTimeout):
         return f"{kind} (timed out while connecting to the host)"
+    if isinstance(error, requests.exceptions.InvalidSchema):
+        return f"{kind} (a socks proxy needs the PySocks package)"
+    if isinstance(error, requests.exceptions.ProxyError):
+        causes: list[BaseException] = []
+        seen: set[int] = set()
+        nested: BaseException | None = error.args[0] if error.args else None
+        while isinstance(nested, BaseException) and id(nested) not in seen:
+            seen.add(id(nested))
+            causes.append(nested)
+            nested = nested.__context__
+        if any("tunnel connection failed" in str(c).lower() for c in causes):
+            # urllib3 speaks for the proxy here; the text is a safe
+            # template ("Tunnel connection failed: <code>") rather than
+            # arbitrary remote input, yet quoting it wholesale would
+            # still undercut the redaction contract, so only its shape
+            # is named.
+            return f"{kind} (the proxy refused the CONNECT tunnel)"
+        return f"{kind} (the proxy is unreachable or refused the connection)"
     if isinstance(error, requests.exceptions.ChunkedEncodingError):
         return f"{kind} (the response ended before its declared size)"
     if type(error) is requests.ConnectionError:
@@ -1113,16 +1289,19 @@ def format_report(
     summary: Summary,
     *,
     warmup: bool,
+    proxy: str | None = None,
 ) -> str:
     """Render the human-readable measurement report.
 
-    Any credentials in ``url`` are redacted.
+    Any credentials in ``url`` and in ``proxy`` are redacted.
 
     Args:
         url: Measured URL.
         results: Measured runs in execution order.
         summary: Aggregated statistics of ``results``.
         warmup: Whether a discarded warm-up request was sent.
+        proxy: Proxy the requests were routed through, or ``None``
+            when they went directly.
 
     Returns:
         The report text, without a trailing newline.
@@ -1148,6 +1327,7 @@ def format_report(
     )
     lines = [
         f"URL: {_visible(redact_url(url))}",
+        *([] if proxy is None else [f"Proxy: {_visible(redact_url(proxy))}"]),
         f"Runs measured: {summary.runs}"
         + (" (warm-up excluded)" if warmup else ""),
         "",
@@ -1502,6 +1682,19 @@ def build_parser() -> RedactingArgumentParser:
         help="skip the discarded first request (DNS and TLS land in run 1)",
     )
     parser.add_argument(
+        "-p",
+        "--proxy",
+        type=validate_proxy,
+        metavar="URL",
+        default=None,
+        help=(
+            "route the measurement through this http(s) or socks5 "
+            "proxy (a bare host:port counts as http), for example "
+            "http://gate.local:3128; credentials typed in the URL "
+            "appear as *** everywhere; SOCKS needs the PySocks package"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="print the runs and summary as JSON instead of a table",
@@ -1521,25 +1714,29 @@ def build_payload(
     summary: Summary,
     *,
     warmup: bool,
+    proxy: str | None = None,
 ) -> dict[str, object]:
     """Build the JSON document printed by ``--json``.
 
-    Any credentials in ``url`` are redacted, and each run carries the
-    speeds the table prints, so a consumer need not re-derive them from
-    the byte count and the elapsed time.
+    Any credentials in ``url`` and in ``proxy`` are redacted, and each
+    run carries the speeds the table prints, so a consumer need not
+    re-derive them from the byte count and the elapsed time.
 
     Args:
         url: Measured URL.
         results: Measured runs in execution order.
         summary: Aggregated statistics of ``results``.
         warmup: Whether a discarded warm-up request was sent.
+        proxy: Proxy the requests were routed through, or ``None``
+            when they went directly.
 
     Returns:
         A JSON-serializable mapping with the URL, the per-run results,
-        the summary, and the units used.
+        the summary, the units used, and the route.
     """
     return {
         "url": redact_url(url),
+        "proxy": None if proxy is None else redact_url(proxy),
         "warmup": warmup,
         "units": {
             "speed": "MiB/s",
@@ -1656,11 +1853,12 @@ def _run(argv: Sequence[str] | None) -> int:
     configure_logging(args.verbose)
     try:
         url = validate_url(args.url)
+        proxy: str | None = args.proxy
     except ValueError as exc:
         logger.error("%s", exc)
         return 2
     try:
-        with requests.Session() as session:
+        with session_route(proxy) as (session, _active_proxy):
             results = run_series(
                 session,
                 url,
@@ -1679,6 +1877,16 @@ def _run(argv: Sequence[str] | None) -> int:
         return 1
     except (requests.RequestException, MeasurementError) as exc:
         logger.error("measurement failed: %s", _visible(redact_text(str(exc))))
+        if proxy is not None:
+            alternative = _remote_dns_scheme(proxy)
+            if alternative is not None:
+                logger.info(
+                    "note: %s resolves the hostname on this machine; the "
+                    "same proxy spelled %s asks the proxy to resolve it, "
+                    "which avoids addresses picked for this network",
+                    proxy.split("://", 1)[0],
+                    alternative,
+                )
         if args.verbose:
             logger.debug("traceback", exc_info=True)
         return 1
@@ -1691,6 +1899,7 @@ def _run(argv: Sequence[str] | None) -> int:
             results,
             summary,
             warmup=not args.no_warmup,
+            proxy=proxy,
         )
         report = json.dumps(payload, indent=2)
     else:
@@ -1699,6 +1908,7 @@ def _run(argv: Sequence[str] | None) -> int:
             results,
             summary,
             warmup=not args.no_warmup,
+            proxy=proxy,
         )
     if not write_report(report):
         return 1

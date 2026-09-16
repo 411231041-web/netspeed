@@ -1,4 +1,4 @@
-"""Pytest fixtures exposing the local test HTTP server."""
+"""Pytest fixtures exposing the local test servers and proxies."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from tests.http_proxy import ForwardProxy, start_proxy
 from tests.http_server import LocalServer, start_server
 
 
@@ -18,6 +19,21 @@ def server() -> Iterator[LocalServer]:
         path. The server is shut down after the test.
     """
     running = start_server()
+    try:
+        yield running
+    finally:
+        running.stop()
+
+
+@pytest.fixture()
+def proxy() -> Iterator[ForwardProxy]:
+    """Start a local forward proxy on an ephemeral loopback port.
+
+    Yields:
+        The running proxy, whose logs record every plain request line
+        and every ``CONNECT`` authority. It is stopped after the test.
+    """
+    running = start_proxy()
     try:
         yield running
     finally:
