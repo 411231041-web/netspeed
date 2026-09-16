@@ -1484,6 +1484,30 @@ def _hide(
     return False
 
 
+class _PlainHelpFormatter(argparse.HelpFormatter):
+    """Help formatter that never asks its stream to identify itself.
+
+    ``argparse`` 3.14 builds a formatter as soon as an argument is added
+    and lets the formatter decide whether to colourise its output, which
+    it does by asking ``sys.stdout`` for a file descriptor; a stream that
+    is closed raises from that question, and the parser cannot be built
+    at all. This tool writes plain text to a stream that may be a pipe, a
+    file, or a log, so the decision is taken here and the stream is never
+    asked.
+    """
+
+    def __init__(self, prog: str, **kwargs: Any) -> None:
+        """Build a formatter with colour detection switched off.
+
+        Args:
+            prog: Program name shown in the usage line.
+            **kwargs: Remaining formatter options, forwarded unchanged.
+        """
+        if sys.version_info >= (3, 14):
+            kwargs["color"] = False
+        super().__init__(prog, **kwargs)
+
+
 class RedactingArgumentParser(argparse.ArgumentParser):
     """Argument parser that redacts credentials from its error output.
 
@@ -1643,11 +1667,9 @@ def build_parser() -> RedactingArgumentParser:
     """
     extra: dict[str, Any] = {}
     if sys.version_info >= (3, 14):
-        # argparse 3.14 colours its usage text by asking sys.stdout
-        # whether it is a terminal, and a closed stream makes that
-        # question raise while the parser is being built. The report is
-        # plain text on a stream that may be a pipe or a log, so the
-        # question is not asked.
+        # The formatter decides against colouring on its own, but the
+        # parser colours the formatter again once it is built, so it is
+        # told the same thing.
         extra["color"] = False
     parser = RedactingArgumentParser(
         prog="netspeed",
@@ -1662,6 +1684,7 @@ def build_parser() -> RedactingArgumentParser:
             "--timeout is an inactivity limit per read, not a total "
             "deadline."
         ),
+        formatter_class=_PlainHelpFormatter,
         **extra,
     )
     parser.add_argument(

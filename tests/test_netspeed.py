@@ -927,6 +927,30 @@ def test_main_returns_one_on_empty_body(
     assert capsys.readouterr().out == ""
 
 
+def test_build_parser_never_asks_the_output_stream_about_colour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building the parser does not probe the output stream.
+
+    ``argparse`` decides whether to colour its usage text by asking
+    ``sys.stdout`` for a file descriptor, and a closed stream raises
+    there, so the parser has to be built without consulting it. The
+    question is intercepted rather than staged with a broken stream,
+    because an environment that answers it earlier, such as a dumb
+    terminal or a request for no colour, would hide the probe.
+    """
+    if sys.version_info < (3, 14):
+        pytest.skip("argparse asks the stream about colour from 3.14 on")
+    colorize = importlib.import_module("_colorize")
+    monkeypatch.setattr(
+        colorize,
+        "can_colorize",
+        lambda *args, **kwargs: pytest.fail("the output stream was probed"),
+    )
+
+    netspeed.build_parser()
+
+
 def test_main_returns_one_when_stdout_is_closed(
     payload_url: str,
     capsys: pytest.CaptureFixture[str],
